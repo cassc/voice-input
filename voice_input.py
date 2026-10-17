@@ -1,4 +1,5 @@
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -12,6 +13,9 @@ RATE = 16000
 MIC = os.environ.get("VOICE_MIC", "pulse")
 MODEL_DIR = Path.home() / ".cache/voice-input/sense-voice"
 MODEL_URL = "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/"
+VAD_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+SOUNDS = Path("/usr/share/sounds/freedesktop/stereo")
+WINDOW = 512
 COLORS = {"loading": "#555555", "idle": "#9a9a9a", "starting": "#e09090", "listening": "#e04040", "working": "#e0b030"}
 
 
@@ -30,8 +34,16 @@ def already_running():
         return False
 
 
-def notify(msg):
-    subprocess.run(["notify-send", "-t", "1500", "Voice input", msg])
+def notify(msg, replace=None, timeout=1500):
+    cmd = ["notify-send", "-p", "-t", str(timeout), "Voice input", msg]
+    if replace:
+        cmd[1:1] = ["-r", replace]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def play(name):
+    if os.environ.get("VOICE_SOUND") != "0" and (SOUNDS / name).exists():
+        subprocess.Popen(["pw-play", str(SOUNDS / name)])
 
 
 def type_text(text):
@@ -49,7 +61,8 @@ class App:
     def __init__(self):
         self.model = None
         self.state = "loading"
-        self.chunks = []
+        self.vad = None
+        self.audio = None
         self.stream = None
         self.lock = threading.Lock()
 
@@ -73,11 +86,16 @@ class App:
         import sherpa_onnx
 
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        for f in ("model.int8.onnx", "tokens.txt"):
+        files = {f: MODEL_URL + f for f in ("model.int8.onnx", "tokens.txt")}
+        files["silero_vad.onnx"] = VAD_URL
+        for f, url in files.items():
             if not (MODEL_DIR / f).exists():
                 notify(f"Downloading {f}")
-                urllib.request.urlretrieve(MODEL_URL + f, MODEL_DIR / f"{f}.part")
+                urllib.request.urlretrieve(url, MODEL_DIR / f"{f}.part")
                 (MODEL_DIR / f"{f}.part").rename(MODEL_DIR / f)
+        silero = sherpa_onnx.SileroVadModelConfig(model=str(MODEL_DIR / "silero_vad.onnx"), min_silence_duration=0.5,
+                                                  window_size=WINDOW)
+        self.vad = sherpa_onnx.VoiceActivityDetector(sherpa_onnx.VadModelConfig(silero_vad=silero, sample_rate=RATE))
         self.model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=str(MODEL_DIR / "model.int8.onnx"), tokens=str(MODEL_DIR / "tokens.txt"),
             num_threads=4, use_itn=True)
@@ -96,45 +114,82 @@ class App:
     def start(self):
         import sounddevice as sd
 
-        self.chunks = []
+        self.audio = queue.Queue()
+        self.vad.reset()
         self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32", device=MIC,
                                      callback=self.on_audio)
         self.set_state("starting")
         self.stream.start()
+        threading.Thread(target=self.listen, daemon=True).start()
 
     def on_audio(self, data, *_):
         # Bluetooth mics send silence for ~1 s while switching to headset mode.
         if self.state == "starting" and data.any():
+            self.state = "listening"
             threading.Thread(target=self.set_state, args=("listening",)).start()
-        self.chunks.append(data.copy())
+            play("message.oga")
+        self.audio.put(data[:, 0].copy())
 
     def stop(self):
         time.sleep(0.3)
         self.stream.stop()
         self.stream.close()
+        play("complete.oga")
         self.set_state("working")
-        threading.Thread(target=self.transcribe, daemon=True).start()
+        self.audio.put(None)
 
-    def transcribe(self):
+    def decode(self, samples):
+        stream = self.model.create_stream()
+        stream.accept_waveform(RATE, samples)
+        self.model.decode_stream(stream)
+        return stream.result.text.strip()
+
+    def paste(self, text):
+        # Silence comes back as "." or similar.
+        if not any(c.isalnum() for c in text):
+            return
+        if self.pasted and text[0].isascii() and not self.pasted[-1].isspace():
+            text = " " + text
+        type_text(text)
+        self.pasted = text
+
+    def phrase_done(self):
+        found = not self.vad.empty()
+        while not self.vad.empty():
+            self.vad.pop()
+        return found
+
+    def listen(self):
+        """Paste each phrase after a pause, and show a live guess of the current phrase in a popup."""
         import numpy as np
 
+        buf, phrase, peak, shown, popup = np.zeros(0, "float32"), [], 0.0, 0.0, None
+        self.pasted = ""
         try:
-            audio = np.concatenate(self.chunks).flatten() if self.chunks else np.zeros(0, "float32")
-            if len(audio) < RATE / 2:
-                return
-            if abs(audio).max() < 0.01:
-                notify("Mic gave only silence")
-                return
-            stream = self.model.create_stream()
-            stream.accept_waveform(RATE, audio)
-            self.model.decode_stream(stream)
-            text = stream.result.text.strip()
-            # Silence comes back as "." or similar.
-            if any(c.isalnum() for c in text):
-                type_text(text)
+            while (data := self.audio.get()) is not None:
+                peak = max(peak, float(abs(data).max()))
+                buf = np.concatenate([buf, data])
+                phrase.append(data)
+                while len(buf) >= WINDOW:
+                    self.vad.accept_waveform(buf[:WINDOW])
+                    buf = buf[WINDOW:]
+                # Decode all audio since the last paste: the VAD segment cuts the first sound.
+                if self.phrase_done():
+                    self.paste(self.decode(np.concatenate(phrase)))
+                    phrase = []
+                elif self.vad.is_speech_detected() and time.time() - shown > 0.5:
+                    popup = notify(self.decode(np.concatenate(phrase)) or "...", popup, 10000)
+                    shown = time.time()
+            self.vad.flush()
+            if self.phrase_done():
+                self.paste(self.decode(np.concatenate(phrase)))
+            if peak < 0.01:
+                notify(f"Mic gave only silence (peak {peak:.4f})")
         except Exception as e:
             notify(f"Error: {e}")
         finally:
+            if popup:
+                notify("", popup, 1)
             self.set_state("idle")
 
     def quit(self, *_):

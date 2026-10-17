@@ -27,7 +27,9 @@ Check it runs: `pgrep -af voice-input`. A second start prints "already running".
 
 ## Use
 
-Click the tray icon or press `$mod+grave` to start. Press again to stop. The text is pasted into the focused window (Shift+Insert). Your clipboard is restored after.
+Click the tray icon or press `$mod+grave` to start. A sound plays when the mic is ready: talk then. Press again to stop (another sound).
+
+While you talk, a popup shows a live guess of the current phrase, and it improves as you speak. After each pause (0.5 s), the phrase is pasted into the focused window (Shift+Insert). Your clipboard is restored after.
 
 Icon colors: dark grey = loading model, grey = ready, pink = mic starting (wait), red = listening (talk now), yellow = working.
 
@@ -36,3 +38,4 @@ To quit: `pkill -f bin/voice-input`. (There is no right-click menu: pystray has 
 ## Env vars
 
 - `VOICE_MIC` - sounddevice input, default `pulse` (the PipeWire default source).
+- `VOICE_SOUND=0` - no ready/stop sounds.
