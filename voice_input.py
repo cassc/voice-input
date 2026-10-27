@@ -16,6 +16,8 @@ MODEL_URL = "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-
 VAD_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 SOUNDS = Path("/usr/share/sounds/freedesktop/stereo")
 WINDOW = 512
+# The VAD fires late and cuts the first sound, so keep this much audio before it.
+PAD = RATE // 2
 COLORS = {"loading": "#555555", "idle": "#9a9a9a", "starting": "#e09090", "listening": "#e04040", "working": "#e0b030"}
 
 
@@ -93,7 +95,7 @@ class App:
                 notify(f"Downloading {f}")
                 urllib.request.urlretrieve(url, MODEL_DIR / f"{f}.part")
                 (MODEL_DIR / f"{f}.part").rename(MODEL_DIR / f)
-        silero = sherpa_onnx.SileroVadModelConfig(model=str(MODEL_DIR / "silero_vad.onnx"), min_silence_duration=0.5,
+        silero = sherpa_onnx.SileroVadModelConfig(model=str(MODEL_DIR / "silero_vad.onnx"), min_silence_duration=1.0,
                                                   window_size=WINDOW)
         self.vad = sherpa_onnx.VoiceActivityDetector(sherpa_onnx.VadModelConfig(silero_vad=silero, sample_rate=RATE))
         self.model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
@@ -163,26 +165,29 @@ class App:
         """Paste each phrase after a pause, and show a live guess of the current phrase in a popup."""
         import numpy as np
 
-        buf, phrase, peak, shown, popup = np.zeros(0, "float32"), [], 0.0, 0.0, None
+        buf = phrase = np.zeros(0, "float32")
+        peak, shown, popup = 0.0, 0.0, None
         self.pasted = ""
         try:
             while (data := self.audio.get()) is not None:
                 peak = max(peak, float(abs(data).max()))
                 buf = np.concatenate([buf, data])
-                phrase.append(data)
+                phrase = np.concatenate([phrase, data])
                 while len(buf) >= WINDOW:
                     self.vad.accept_waveform(buf[:WINDOW])
                     buf = buf[WINDOW:]
-                # Decode all audio since the last paste: the VAD segment cuts the first sound.
                 if self.phrase_done():
-                    self.paste(self.decode(np.concatenate(phrase)))
-                    phrase = []
-                elif self.vad.is_speech_detected() and time.time() - shown > 0.5:
-                    popup = notify(self.decode(np.concatenate(phrase)) or "...", popup, 10000)
+                    self.paste(self.decode(phrase))
+                    phrase = phrase[:0]
+                elif not self.vad.is_speech_detected():
+                    # Silence before speech makes the model invent words.
+                    phrase = phrase[-PAD:]
+                elif time.time() - shown > 0.5:
+                    popup = notify(self.decode(phrase) or "...", popup, 10000)
                     shown = time.time()
             self.vad.flush()
             if self.phrase_done():
-                self.paste(self.decode(np.concatenate(phrase)))
+                self.paste(self.decode(phrase))
             if peak < 0.01:
                 notify(f"Mic gave only silence (peak {peak:.4f})")
         except Exception as e:
